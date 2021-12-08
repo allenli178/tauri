@@ -41,6 +41,10 @@ use wry::application::platform::windows::{WindowBuilderExtWindows, WindowExtWind
 #[cfg(feature = "system-tray")]
 use wry::application::system_tray::{SystemTray as WrySystemTray, SystemTrayBuilder};
 
+use once_cell::sync::Lazy;
+
+static EGUI_ID: Lazy<Mutex<Option<WindowId>>> = Lazy::new(|| Mutex::new(None));
+
 use tauri_utils::config::WindowConfig;
 use uuid::Uuid;
 use wry::{
@@ -975,6 +979,7 @@ pub enum WindowMessage {
   SetSkipTaskbar(bool),
   DragWindow,
   UpdateMenuItem(u16, MenuUpdate),
+  RequestRedraw,
 }
 
 #[derive(Debug, Clone)]
@@ -1031,6 +1036,7 @@ pub enum Message {
     Box<dyn FnOnce() -> (String, WryWindowBuilder) + Send>,
     Sender<Result<Weak<Window>>>,
   ),
+  CreateGLWindow(Box<dyn epi::App + Send>, epi::NativeOptions),
   GlobalShortcut(GlobalShortcutMessage),
   Clipboard(ClipboardMessage),
 }
@@ -1434,6 +1440,12 @@ impl fmt::Debug for TrayContext {
 enum WindowHandle {
   Webview(WebView),
   Window(Arc<Window>),
+  GLWindow(
+    glutin::ContextWrapper<glutin::PossiblyCurrent, glutin::window::Window>,
+    glow::Context,
+    egui_glow::Painter,
+    egui_tao::epi::EpiIntegration,
+  ),
 }
 
 impl fmt::Debug for WindowHandle {
@@ -1447,6 +1459,7 @@ impl WindowHandle {
     match self {
       Self::Webview(w) => w.window(),
       Self::Window(w) => w,
+      Self::GLWindow(w, ..) => w.window(),
     }
   }
 
@@ -1454,6 +1467,7 @@ impl WindowHandle {
     match self {
       WindowHandle::Window(w) => w.inner_size(),
       WindowHandle::Webview(w) => w.inner_size(),
+      WindowHandle::GLWindow(w, ..) => w.window().inner_size(),
     }
   }
 }
@@ -1496,6 +1510,16 @@ impl WryHandle {
     let (tx, rx) = channel();
     send_user_message(&self.context, Message::CreateWindow(Box::new(f), tx))?;
     rx.recv().unwrap()
+  }
+
+  /// Creates a new egui window.
+  pub fn create_egui_window(
+    &self,
+    app: Box<dyn epi::App + Send>,
+    native_options: epi::NativeOptions,
+  ) -> Result<()> {
+    send_user_message(&self.context, Message::CreateGLWindow(app, native_options))?;
+    Ok(())
   }
 
   /// Send a message to the event loop.
@@ -2041,6 +2065,9 @@ fn handle_user_message(
               }
             }
           }
+          WindowMessage::RequestRedraw => {
+            window.request_redraw();
+          }
         }
       }
     }
@@ -2125,6 +2152,64 @@ fn handle_user_message(
       } else {
         sender.send(Err(Error::CreateWindow)).unwrap();
       }
+    }
+    Message::CreateGLWindow(app, native_options) => {
+      let persistence = egui_tao::epi::Persistence::from_app_name(app.name());
+      let window_settings = persistence.load_window_settings();
+      let window_builder =
+        egui_tao::epi::window_builder(&native_options, &window_settings).with_title(app.name());
+      let gl_window = unsafe {
+        glutin::ContextBuilder::new()
+          .with_depth_buffer(0)
+          .with_srgb(true)
+          .with_stencil_buffer(0)
+          .with_vsync(true)
+          .build_windowed(window_builder, event_loop)
+          .unwrap()
+          .make_current()
+          .unwrap()
+      };
+      let window_id = gl_window.window().id();
+      let mut gui_lock = EGUI_ID.lock().unwrap();
+      *gui_lock = Some(window_id);
+
+      let gl = unsafe { glow::Context::from_loader_function(|s| gl_window.get_proc_address(s)) };
+
+      unsafe {
+        use glow::HasContext as _;
+        gl.enable(glow::FRAMEBUFFER_SRGB);
+      }
+
+      //TODO find a way to send repaint signal
+      struct GlowRepaintSignal(std::sync::Mutex<u8>);
+
+      impl epi::RepaintSignal for GlowRepaintSignal {
+        fn request_repaint(&self) {}
+      }
+
+      let repaint_signal = std::sync::Arc::new(GlowRepaintSignal(std::sync::Mutex::new(0)));
+
+      let mut painter = egui_glow::Painter::new(&gl, None, "")
+        .map_err(|error| eprintln!("some OpenGL error occurred {}\n", error))
+        .unwrap();
+
+      let integration = egui_tao::epi::EpiIntegration::new(
+        "egui_glow",
+        gl_window.window(),
+        &mut painter,
+        repaint_signal,
+        persistence,
+        app,
+      );
+
+      windows.lock().expect("poisoned webview collection").insert(
+        window_id,
+        WindowWrapper {
+          label: "egui_window".to_string(),
+          inner: WindowHandle::GLWindow(gl_window, gl, painter, integration),
+          menu_items: Default::default(),
+        },
+      );
     }
 
     #[cfg(feature = "system-tray")]
@@ -2242,6 +2327,7 @@ fn handle_event_loop(
       window_count: windows.lock().expect("poisoned webview collection").len(),
     };
   }
+
   *control_flow = ControlFlow::Wait;
 
   match event {
@@ -2424,6 +2510,109 @@ fn handle_event_loop(
     window_count: windows.lock().expect("poisoned webview collection").len(),
   };
   it
+}
+
+fn handle_gl_loop(
+  event: Event<'_, Message>,
+  event_loop: &EventLoopWindowTarget<Message>,
+  control_flow: &mut ControlFlow,
+  context: EventLoopIterationContext<'_>,
+  web_context: &WebContextStore,
+) {
+  let EventLoopIterationContext {
+    callback,
+    windows,
+    window_event_listeners,
+    global_shortcut_manager,
+    global_shortcut_manager_handle,
+    clipboard_manager,
+    menu_event_listeners,
+    #[cfg(feature = "system-tray")]
+    tray_context,
+  } = context;
+  if let Some(id) = *EGUI_ID.lock().unwrap() {
+    if let Some(win) = windows.lock().unwrap().get_mut(&id) {
+      if let WindowHandle::GLWindow(gl_window, gl, painter, integration) = &mut win.inner {
+        let mut redraw = || {
+          if false {
+            //TODO!is_focused {
+            // On Mac, a minimized Window uses up all CPU: https://github.com/emilk/egui/issues/325
+            // We can't know if we are minimized: https://github.com/rust-windowing/winit/issues/208
+            // But we know if we are focused (in foreground). When minimized, we are not focused.
+            // However, a user may want an egui with an animation in the background,
+            // so we still need to repaint quite fast.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+          }
+
+          let (needs_repaint, shapes) = integration.update(gl_window.window(), painter);
+          let clipped_meshes = integration.egui_ctx.tessellate(shapes);
+
+          {
+            let color = integration.app.clear_color();
+            unsafe {
+              use glow::HasContext as _;
+              gl.disable(glow::SCISSOR_TEST);
+              gl.clear_color(color[0], color[1], color[2], color[3]);
+              gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            painter.upload_egui_texture(&gl, &integration.egui_ctx.texture());
+            painter.paint_meshes(
+              gl_window.window().inner_size().into(),
+              &gl,
+              integration.egui_ctx.pixels_per_point(),
+              clipped_meshes,
+            );
+
+            gl_window.swap_buffers().unwrap();
+          }
+
+          {
+            *control_flow = if integration.should_quit() {
+              glutin::event_loop::ControlFlow::Exit
+            } else if needs_repaint {
+              gl_window.window().request_redraw();
+              glutin::event_loop::ControlFlow::Poll
+            } else {
+              glutin::event_loop::ControlFlow::Wait
+            };
+          }
+
+          integration.maybe_autosave(gl_window.window());
+        };
+        match event {
+          // Platform-dependent event handlers to workaround a winit bug
+          // See: https://github.com/rust-windowing/winit/issues/987
+          // See: https://github.com/rust-windowing/winit/issues/1619
+          glutin::event::Event::RedrawEventsCleared if cfg!(windows) => redraw(),
+          glutin::event::Event::RedrawRequested(_) if !cfg!(windows) => redraw(),
+          glutin::event::Event::WindowEvent { event, .. } => {
+            if let glutin::event::WindowEvent::Focused(_new_focused) = event {
+              //is_focused = new_focused;
+            }
+
+            if let glutin::event::WindowEvent::Resized(physical_size) = event {
+              gl_window.resize(physical_size);
+            }
+
+            integration.on_event(&event);
+            if integration.should_quit() {
+              *control_flow = glutin::event_loop::ControlFlow::Exit;
+            }
+
+            gl_window.window().request_redraw(); // TODO: ask egui if the events warrants a repaint instead
+          }
+          glutin::event::Event::LoopDestroyed => {
+            integration.on_exit(gl_window.window());
+            painter.destroy(&gl);
+          }
+          glutin::event::Event::UserEvent(_) => {
+            //gl_window.window().request_redraw();
+          }
+          _ => (),
+        }
+      }
+    }
+  }
 }
 
 fn on_window_close<'a>(
