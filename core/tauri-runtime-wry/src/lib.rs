@@ -1036,7 +1036,11 @@ pub enum Message {
     Box<dyn FnOnce() -> (String, WryWindowBuilder) + Send>,
     Sender<Result<Weak<Window>>>,
   ),
-  CreateGLWindow(Box<dyn epi::App + Send>, epi::NativeOptions),
+  CreateGLWindow(
+    Box<dyn epi::App + Send>,
+    epi::NativeOptions,
+    EventLoopProxy<Message>,
+  ),
   GlobalShortcut(GlobalShortcutMessage),
   Clipboard(ClipboardMessage),
 }
@@ -1518,7 +1522,11 @@ impl WryHandle {
     app: Box<dyn epi::App + Send>,
     native_options: epi::NativeOptions,
   ) -> Result<()> {
-    send_user_message(&self.context, Message::CreateGLWindow(app, native_options))?;
+    let proxy = self.context.proxy.clone();
+    send_user_message(
+      &self.context,
+      Message::CreateGLWindow(app, native_options, proxy),
+    )?;
     Ok(())
   }
 
@@ -2153,7 +2161,7 @@ fn handle_user_message(
         sender.send(Err(Error::CreateWindow)).unwrap();
       }
     }
-    Message::CreateGLWindow(app, native_options) => {
+    Message::CreateGLWindow(app, native_options, proxy) => {
       let persistence = egui_tao::epi::Persistence::from_app_name(app.name());
       let window_settings = persistence.load_window_settings();
       let window_builder =
@@ -2170,6 +2178,7 @@ fn handle_user_message(
           .unwrap()
       };
       let window_id = gl_window.window().id();
+      // TODO check if egui already exist
       let mut gui_lock = EGUI_ID.lock().unwrap();
       *gui_lock = Some(window_id);
 
@@ -2180,14 +2189,17 @@ fn handle_user_message(
         gl.enable(glow::FRAMEBUFFER_SRGB);
       }
 
-      //TODO find a way to send repaint signal
-      struct GlowRepaintSignal(std::sync::Mutex<u8>);
+      struct GlowRepaintSignal(EventLoopProxy<Message>, WindowId);
 
       impl epi::RepaintSignal for GlowRepaintSignal {
-        fn request_repaint(&self) {}
+        fn request_repaint(&self) {
+          let _ = self
+            .0
+            .send_event(Message::Window(self.1, WindowMessage::RequestRedraw));
+        }
       }
 
-      let repaint_signal = std::sync::Arc::new(GlowRepaintSignal(std::sync::Mutex::new(0)));
+      let repaint_signal = std::sync::Arc::new(GlowRepaintSignal(proxy, window_id.clone()));
 
       let mut painter = egui_glow::Painter::new(&gl, None, "")
         .map_err(|error| eprintln!("some OpenGL error occurred {}\n", error))
@@ -2512,26 +2524,29 @@ fn handle_event_loop(
   it
 }
 
+#[allow(dead_code)]
 fn handle_gl_loop(
   event: Event<'_, Message>,
-  event_loop: &EventLoopWindowTarget<Message>,
+  _event_loop: &EventLoopWindowTarget<Message>,
   control_flow: &mut ControlFlow,
   context: EventLoopIterationContext<'_>,
-  web_context: &WebContextStore,
+  _web_context: &WebContextStore,
 ) {
   let EventLoopIterationContext {
     callback,
     windows,
+    #[cfg(target_os = "linux")]
     window_event_listeners,
-    global_shortcut_manager,
-    global_shortcut_manager_handle,
-    clipboard_manager,
     menu_event_listeners,
     #[cfg(feature = "system-tray")]
     tray_context,
+    ..
   } = context;
-  if let Some(id) = *EGUI_ID.lock().unwrap() {
-    if let Some(win) = windows.lock().unwrap().get_mut(&id) {
+  let mut egui_id = EGUI_ID.lock().unwrap();
+  if let Some(id) = *egui_id {
+    let mut windows = windows.lock().unwrap();
+    let mut should_quit = false;
+    if let Some(win) = windows.get_mut(&id) {
       if let WindowHandle::GLWindow(gl_window, gl, painter, integration) = &mut win.inner {
         let mut redraw = || {
           if false {
@@ -2568,7 +2583,8 @@ fn handle_gl_loop(
 
           {
             *control_flow = if integration.should_quit() {
-              glutin::event_loop::ControlFlow::Exit
+              should_quit = true;
+              glutin::event_loop::ControlFlow::Wait
             } else if needs_repaint {
               gl_window.window().request_redraw();
               glutin::event_loop::ControlFlow::Poll
@@ -2596,21 +2612,28 @@ fn handle_gl_loop(
 
             integration.on_event(&event);
             if integration.should_quit() {
-              *control_flow = glutin::event_loop::ControlFlow::Exit;
+              should_quit = true;
+              *control_flow = glutin::event_loop::ControlFlow::Wait;
             }
 
-            gl_window.window().request_redraw(); // TODO: ask egui if the events warrants a repaint instead
-          }
-          glutin::event::Event::LoopDestroyed => {
-            integration.on_exit(gl_window.window());
-            painter.destroy(&gl);
-          }
-          glutin::event::Event::UserEvent(_) => {
-            //gl_window.window().request_redraw();
+            gl_window.window().request_redraw();
           }
           _ => (),
         }
       }
+    }
+
+    if should_quit {
+      *egui_id = None;
+      on_window_close(
+        callback,
+        id,
+        windows,
+        control_flow,
+        #[cfg(target_os = "linux")]
+        window_event_listeners,
+        menu_event_listeners.clone(),
+      );
     }
   }
 }
@@ -2624,6 +2647,12 @@ fn on_window_close<'a>(
   menu_event_listeners: MenuEventListeners,
 ) {
   if let Some(webview) = windows.remove(&window_id) {
+    // Destrooy GL context if its a GLWindow
+    if let WindowHandle::GLWindow(gl_window, gl, mut painter, mut integration) = webview.inner {
+      integration.on_exit(gl_window.window());
+      painter.destroy(&gl);
+    }
+
     let is_empty = windows.is_empty();
     drop(windows);
     menu_event_listeners.lock().unwrap().remove(&window_id);

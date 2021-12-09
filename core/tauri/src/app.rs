@@ -210,6 +210,15 @@ impl AppHandle<crate::Wry> {
     self.runtime_handle.create_tao_window(f).map_err(Into::into)
   }
 
+  /// TODO
+  pub fn create_egui_window(
+    &self,
+    app: Box<dyn epi::App + Send>,
+    native_options: epi::NativeOptions,
+  ) -> crate::Result<()> {
+    self.runtime_handle.create_egui_window(app, native_options).map_err(Into::into)
+  }
+
   /// Sends a window message to the event loop.
   pub fn send_tao_window_event(
     &self,
