@@ -1849,6 +1849,7 @@ impl Runtime for Wry {
     let clipboard_manager = self.clipboard_manager.clone();
 
     let mut iteration = RunIteration::default();
+    let mut is_focused = true;
 
     self
       .event_loop
@@ -1857,6 +1858,24 @@ impl Runtime for Wry {
         if let Event::MainEventsCleared = &event {
           *control_flow = ControlFlow::Exit;
         }
+        handle_gl_loop(
+          &event,
+          event_loop,
+          control_flow,
+          EventLoopIterationContext {
+            callback: &mut callback,
+            windows: windows.clone(),
+            window_event_listeners: &window_event_listeners,
+            global_shortcut_manager: global_shortcut_manager.clone(),
+            global_shortcut_manager_handle: &global_shortcut_manager_handle,
+            clipboard_manager: clipboard_manager.clone(),
+            menu_event_listeners: &menu_event_listeners,
+            #[cfg(feature = "system-tray")]
+            tray_context: &tray_context,
+          },
+          &web_context,
+          &mut is_focused,
+        );
         iteration = handle_event_loop(
           event,
           event_loop,
@@ -1890,6 +1909,7 @@ impl Runtime for Wry {
     let global_shortcut_manager_handle = self.global_shortcut_manager_handle.clone();
     let clipboard_manager = self.clipboard_manager.clone();
 
+    let mut is_focused = true;
     self.event_loop.run(move |event, event_loop, control_flow| {
       handle_gl_loop(
         &event,
@@ -1907,6 +1927,7 @@ impl Runtime for Wry {
           tray_context: &tray_context,
         },
         &web_context,
+        &mut is_focused,
       );
       handle_event_loop(
         event,
@@ -2179,7 +2200,6 @@ fn handle_user_message(
       }
     }
     Message::CreateGLWindow(app, native_options, proxy) => {
-      // TODO check if egui already exist
       let mut egui_id = EGUI_ID.lock().unwrap();
       if let Some(id) = *egui_id {
         if let WindowHandle::GLWindow(gl_window, gl, painter, integration) =
@@ -2568,6 +2588,7 @@ fn handle_gl_loop(
   control_flow: &mut ControlFlow,
   context: EventLoopIterationContext<'_>,
   _web_context: &WebContextStore,
+  is_focused: &mut bool,
 ) {
   let EventLoopIterationContext {
     callback,
@@ -2586,8 +2607,7 @@ fn handle_gl_loop(
     if let Some(win) = windows.get_mut(&id) {
       if let WindowHandle::GLWindow(gl_window, gl, painter, integration) = &mut win.inner {
         let mut redraw = || {
-          if false {
-            //TODO!is_focused {
+          if !*is_focused {
             // On Mac, a minimized Window uses up all CPU: https://github.com/emilk/egui/issues/325
             // We can't know if we are minimized: https://github.com/rust-windowing/winit/issues/208
             // But we know if we are focused (in foreground). When minimized, we are not focused.
@@ -2638,9 +2658,13 @@ fn handle_gl_loop(
           // See: https://github.com/rust-windowing/winit/issues/1619
           glutin::event::Event::RedrawEventsCleared if cfg!(windows) => redraw(),
           glutin::event::Event::RedrawRequested(_) if !cfg!(windows) => redraw(),
-          glutin::event::Event::WindowEvent { event, .. } => {
-            if let glutin::event::WindowEvent::Focused(_new_focused) = event {
-              //is_focused = new_focused;
+          glutin::event::Event::WindowEvent {
+            event, window_id, ..
+          } => {
+            if let glutin::event::WindowEvent::Focused(new_focused) = event {
+              if window_id == &id {
+                *is_focused = *new_focused;
+              }
             }
 
             if let glutin::event::WindowEvent::Resized(physical_size) = event {
