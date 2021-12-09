@@ -1891,6 +1891,23 @@ impl Runtime for Wry {
     let clipboard_manager = self.clipboard_manager.clone();
 
     self.event_loop.run(move |event, event_loop, control_flow| {
+      handle_gl_loop(
+        &event,
+        event_loop,
+        control_flow,
+        EventLoopIterationContext {
+          callback: &mut callback,
+          windows: windows.clone(),
+          window_event_listeners: &window_event_listeners,
+          global_shortcut_manager: global_shortcut_manager.clone(),
+          global_shortcut_manager_handle: &global_shortcut_manager_handle,
+          clipboard_manager: clipboard_manager.clone(),
+          menu_event_listeners: &menu_event_listeners,
+          #[cfg(feature = "system-tray")]
+          tray_context: &tray_context,
+        },
+        &web_context,
+      );
       handle_event_loop(
         event,
         event_loop,
@@ -2162,6 +2179,18 @@ fn handle_user_message(
       }
     }
     Message::CreateGLWindow(app, native_options, proxy) => {
+      // TODO check if egui already exist
+      let mut egui_id = EGUI_ID.lock().unwrap();
+      if let Some(id) = *egui_id {
+        if let WindowHandle::GLWindow(gl_window, gl, painter, integration) =
+          &mut windows.lock().unwrap().get_mut(&id).unwrap().inner
+        {
+          integration.on_exit(gl_window.window());
+          painter.destroy(&gl);
+        }
+        let _ = proxy.send_event(Message::Window(id, WindowMessage::Close));
+      }
+
       let persistence = egui_tao::epi::Persistence::from_app_name(app.name());
       let window_settings = persistence.load_window_settings();
       let window_builder =
@@ -2178,9 +2207,7 @@ fn handle_user_message(
           .unwrap()
       };
       let window_id = gl_window.window().id();
-      // TODO check if egui already exist
-      let mut gui_lock = EGUI_ID.lock().unwrap();
-      *gui_lock = Some(window_id);
+      *egui_id = Some(window_id);
 
       let gl = unsafe { glow::Context::from_loader_function(|s| gl_window.get_proc_address(s)) };
 
@@ -2213,6 +2240,16 @@ fn handle_user_message(
         persistence,
         app,
       );
+
+      window_event_listeners
+        .lock()
+        .unwrap()
+        .insert(window_id, WindowEventListenersMap::default());
+
+      menu_event_listeners
+        .lock()
+        .unwrap()
+        .insert(window_id, WindowMenuEventListeners::default());
 
       windows.lock().expect("poisoned webview collection").insert(
         window_id,
@@ -2526,7 +2563,7 @@ fn handle_event_loop(
 
 #[allow(dead_code)]
 fn handle_gl_loop(
-  event: Event<'_, Message>,
+  event: &Event<'_, Message>,
   _event_loop: &EventLoopWindowTarget<Message>,
   control_flow: &mut ControlFlow,
   context: EventLoopIterationContext<'_>,
@@ -2542,7 +2579,7 @@ fn handle_gl_loop(
     tray_context,
     ..
   } = context;
-  let mut egui_id = EGUI_ID.lock().unwrap();
+  let egui_id = EGUI_ID.lock().unwrap();
   if let Some(id) = *egui_id {
     let mut windows = windows.lock().unwrap();
     let mut should_quit = false;
@@ -2607,7 +2644,7 @@ fn handle_gl_loop(
             }
 
             if let glutin::event::WindowEvent::Resized(physical_size) = event {
-              gl_window.resize(physical_size);
+              gl_window.resize(*physical_size);
             }
 
             integration.on_event(&event);
@@ -2624,7 +2661,7 @@ fn handle_gl_loop(
     }
 
     if should_quit {
-      *egui_id = None;
+      drop(egui_id);
       on_window_close(
         callback,
         id,
@@ -2648,9 +2685,15 @@ fn on_window_close<'a>(
 ) {
   if let Some(webview) = windows.remove(&window_id) {
     // Destrooy GL context if its a GLWindow
-    if let WindowHandle::GLWindow(gl_window, gl, mut painter, mut integration) = webview.inner {
-      integration.on_exit(gl_window.window());
-      painter.destroy(&gl);
+    let mut egui_id = EGUI_ID.lock().unwrap();
+    if let Some(id) = *egui_id {
+      if id == window_id {
+        if let WindowHandle::GLWindow(gl_window, gl, mut painter, mut integration) = webview.inner {
+          integration.on_exit(gl_window.window());
+          painter.destroy(&gl);
+          *egui_id = None;
+        }
+      }
     }
 
     let is_empty = windows.is_empty();
