@@ -2208,6 +2208,7 @@ fn handle_user_message(
           integration.on_exit(gl_window.window());
           painter.destroy(&gl);
         }
+        *egui_id = None;
         let _ = proxy.send_event(Message::Window(id, WindowMessage::Close));
       }
 
@@ -2661,23 +2662,23 @@ fn handle_gl_loop(
           glutin::event::Event::WindowEvent {
             event, window_id, ..
           } => {
-            if let glutin::event::WindowEvent::Focused(new_focused) = event {
-              if window_id == &id {
+            if window_id == &id {
+              if let glutin::event::WindowEvent::Focused(new_focused) = event {
                 *is_focused = *new_focused;
               }
-            }
 
-            if let glutin::event::WindowEvent::Resized(physical_size) = event {
-              gl_window.resize(*physical_size);
-            }
+              if let glutin::event::WindowEvent::Resized(physical_size) = event {
+                gl_window.resize(*physical_size);
+              }
 
-            integration.on_event(&event);
-            if integration.should_quit() {
-              should_quit = true;
-              *control_flow = glutin::event_loop::ControlFlow::Wait;
-            }
+              integration.on_event(&event);
+              if integration.should_quit() {
+                should_quit = true;
+                *control_flow = glutin::event_loop::ControlFlow::Wait;
+              }
 
-            gl_window.window().request_redraw();
+              gl_window.window().request_redraw();
+            }
           }
           _ => (),
         }
