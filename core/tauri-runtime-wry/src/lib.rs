@@ -105,6 +105,18 @@ use std::{
   thread::{current as current_thread, ThreadId},
 };
 
+#[cfg(target_os = "linux")]
+use std::{
+    ops::DerefMut,
+    cell::RefCell,
+    rc::Rc,
+    sync::atomic::{AtomicU8, Ordering},
+};
+#[cfg(target_os = "linux")]
+use gtk::prelude::*;
+#[cfg(target_os = "linux")]
+use glutin::platform::ContextTraitExt;
+
 #[cfg(feature = "system-tray")]
 mod system_tray;
 #[cfg(feature = "system-tray")]
@@ -1444,11 +1456,20 @@ impl fmt::Debug for TrayContext {
 enum WindowHandle {
   Webview(WebView),
   Window(Arc<Window>),
+  #[cfg(not(target_os = "linux"))]
   GLWindow(
     glutin::ContextWrapper<glutin::PossiblyCurrent, glutin::window::Window>,
     glow::Context,
     egui_glow::Painter,
     egui_tao::epi::EpiIntegration,
+  ),
+  #[cfg(target_os = "linux")]
+  GLWindow(
+    Rc<glutin::ContextWrapper<glutin::PossiblyCurrent, glutin::window::Window>>,
+    Rc<glow::Context>,
+    Rc<RefCell<egui_glow::Painter>>,
+    Rc<RefCell<egui_tao::epi::EpiIntegration>>,
+    Rc<AtomicU8>,
   ),
 }
 
@@ -2202,9 +2223,13 @@ fn handle_user_message(
     Message::CreateGLWindow(app, native_options, proxy) => {
       let mut egui_id = EGUI_ID.lock().unwrap();
       if let Some(id) = *egui_id {
-        if let WindowHandle::GLWindow(gl_window, gl, painter, integration) =
+        if let WindowHandle::GLWindow(gl_window, gl, painter, integration, ..) =
           &mut windows.lock().unwrap().get_mut(&id).unwrap().inner
         {
+          #[cfg(target_os = "linux")]
+          let mut integration = integration.borrow_mut();
+          #[cfg(target_os = "linux")]
+          let mut painter = painter.borrow_mut();
           integration.on_exit(gl_window.window());
           painter.destroy(&gl);
         }
@@ -2272,14 +2297,79 @@ fn handle_user_message(
         .unwrap()
         .insert(window_id, WindowMenuEventListeners::default());
 
-      windows.lock().expect("poisoned webview collection").insert(
-        window_id,
-        WindowWrapper {
-          label: "egui_window".to_string(),
-          inner: WindowHandle::GLWindow(gl_window, gl, painter, integration),
-          menu_items: Default::default(),
-        },
-      );
+      #[cfg(not(target_os = "linux"))]
+      {
+          windows.lock().expect("poisoned webview collection").insert(
+            window_id,
+            WindowWrapper {
+              label: "egui_window".to_string(),
+              inner: WindowHandle::GLWindow(gl_window, gl, painter, integration),
+              menu_items: Default::default(),
+            },
+          );
+      }
+      #[cfg(target_os = "linux")]
+      {
+          let area = unsafe { gl_window.raw_handle() };
+          let integration = Rc::new(RefCell::new(integration));
+          let painter = Rc::new(RefCell::new(painter));
+          let render_flow = Rc::new(AtomicU8::new(1));
+          let gl_window = Rc::new(gl_window);
+          let gl = Rc::new(gl);
+
+          let i = integration.clone();
+            let p = painter.clone();
+            let r = render_flow.clone();
+            let gl_window_ = gl_window.clone();
+            let gl_ = gl.clone();
+            area.connect_render(move |_, _| {
+                let mut integration = i.borrow_mut();
+                let mut painter = p.borrow_mut();
+                let (needs_repaint, shapes) = integration.update(gl_window_.window(), painter.deref_mut());
+                let clipped_meshes = integration.egui_ctx.tessellate(shapes);
+
+                {
+                    let color = integration.app.clear_color();
+                    unsafe {
+                        use glow::HasContext as _;
+                        gl_.disable(glow::SCISSOR_TEST);
+                        gl_.clear_color(color[0], color[1], color[2], color[3]);
+                        gl_.clear(glow::COLOR_BUFFER_BIT);
+                    }
+                    painter.upload_egui_texture(&gl_, &integration.egui_ctx.texture());
+                    painter.paint_meshes(
+                        gl_window_.window().inner_size().into(),
+                        &gl_,
+                        integration.egui_ctx.pixels_per_point(),
+                        clipped_meshes,
+                    );
+                }
+
+                {
+                    let control_flow = if integration.should_quit() {
+                        2
+                    } else if needs_repaint {
+                        0
+                    } else {
+                        1
+                    };
+                    r.store(control_flow, Ordering::Relaxed);
+                }
+
+                integration.maybe_autosave(gl_window_.window());
+                gtk::Inhibit(false)
+            });
+
+
+          windows.lock().expect("poisoned webview collection").insert(
+            window_id,
+            WindowWrapper {
+              label: "egui_window".to_string(),
+              inner: WindowHandle::GLWindow(gl_window, gl, painter, integration, render_flow),
+              menu_items: Default::default(),
+            },
+          );
+      }
     }
 
     #[cfg(feature = "system-tray")]
@@ -2583,6 +2673,7 @@ fn handle_event_loop(
 }
 
 #[allow(dead_code)]
+#[cfg(not(target_os = "linux"))]
 fn handle_gl_loop(
   event: &Event<'_, Message>,
   _event_loop: &EventLoopWindowTarget<Message>,
@@ -2594,8 +2685,6 @@ fn handle_gl_loop(
   let EventLoopIterationContext {
     callback,
     windows,
-    #[cfg(target_os = "linux")]
-    window_event_listeners,
     menu_event_listeners,
     #[cfg(feature = "system-tray")]
     tray_context,
@@ -2692,7 +2781,82 @@ fn handle_gl_loop(
         id,
         windows,
         control_flow,
-        #[cfg(target_os = "linux")]
+        menu_event_listeners.clone(),
+      );
+    }
+  }
+}
+
+#[allow(dead_code)]
+#[cfg(target_os = "linux")]
+fn handle_gl_loop(
+  event: &Event<'_, Message>,
+  _event_loop: &EventLoopWindowTarget<Message>,
+  control_flow: &mut ControlFlow,
+  context: EventLoopIterationContext<'_>,
+  _web_context: &WebContextStore,
+  is_focused: &mut bool,
+) {
+  let EventLoopIterationContext {
+    callback,
+    windows,
+    window_event_listeners,
+    menu_event_listeners,
+    #[cfg(feature = "system-tray")]
+    tray_context,
+    ..
+  } = context;
+  let egui_id = EGUI_ID.lock().unwrap();
+  if let Some(id) = *egui_id {
+    let mut windows = windows.lock().unwrap();
+    let mut should_quit = false;
+    if let Some(win) = windows.get_mut(&id) {
+      if let WindowHandle::GLWindow(gl_window, _gl, _painter, integration, render_flow) = &mut win.inner {
+        let mut integration = integration.borrow_mut();
+        let area = unsafe { gl_window.raw_handle() };
+        match event {
+            glutin::event::Event::MainEventsCleared => {
+                area.queue_render();
+                match render_flow.load(Ordering::Relaxed) {
+                    0 => *control_flow = glutin::event_loop::ControlFlow::Poll,
+                    1 => *control_flow = glutin::event_loop::ControlFlow::Wait,
+                    2 => *control_flow = glutin::event_loop::ControlFlow::Exit,
+                    _ => unreachable!(),
+                }
+            }
+          glutin::event::Event::WindowEvent {
+            event, window_id, ..
+          } => {
+            if window_id == &id {
+              if let glutin::event::WindowEvent::Focused(new_focused) = event {
+                *is_focused = *new_focused;
+              }
+
+              if let glutin::event::WindowEvent::Resized(physical_size) = event {
+                gl_window.resize(*physical_size);
+              }
+
+              integration.on_event(&event);
+              if integration.should_quit() {
+                should_quit = true;
+                *control_flow = glutin::event_loop::ControlFlow::Wait;
+              }
+
+              gl_window.window().request_redraw();
+            }
+          }
+          _ => (),
+        }
+      }
+    }
+
+    if should_quit {
+      drop(egui_id);
+      on_window_close(
+        callback,
+        id,
+        windows,
+        control_flow,
         window_event_listeners,
         menu_event_listeners.clone(),
       );
@@ -2713,7 +2877,11 @@ fn on_window_close<'a>(
     let mut egui_id = EGUI_ID.lock().unwrap();
     if let Some(id) = *egui_id {
       if id == window_id {
-        if let WindowHandle::GLWindow(gl_window, gl, mut painter, mut integration) = webview.inner {
+        if let WindowHandle::GLWindow(gl_window, gl, painter, integration, ..) = webview.inner {
+          #[cfg(target_os = "linux")]
+          let mut integration = integration.borrow_mut();
+          #[cfg(target_os = "linux")]
+          let mut painter = painter.borrow_mut();
           integration.on_exit(gl_window.window());
           painter.destroy(&gl);
           *egui_id = None;
